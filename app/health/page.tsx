@@ -32,7 +32,13 @@ export default function HealthPage() {
         try {
             const saved = localStorage.getItem('foodoscope_history');
             if (saved) {
-                hist = JSON.parse(saved);
+                const parsed: HistoryItem[] = JSON.parse(saved);
+                // Filter out stale dummy entries from earlier dev runs
+                hist = parsed.filter(h => !h.name.includes('Test Food') && !h.name.includes('Key Missing'));
+                // Persist the cleaned list back
+                if (hist.length !== parsed.length) {
+                    localStorage.setItem('foodoscope_history', JSON.stringify(hist));
+                }
             }
         } catch (e) {
             console.error("Failed to load history", e);

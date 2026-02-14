@@ -1,6 +1,20 @@
 import { NextResponse } from 'next/server';
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
+// Analysis result type from AI providers
+interface AnalysisResult {
+    isFood: boolean;
+    dishName?: string;
+    type?: 'packaged' | 'prepared';
+    ingredients?: string[];
+    freshness?: 'fresh' | 'caution' | 'spoiled';
+    calories?: number;
+    protein?: number;
+    fat?: number;
+    reason?: string;
+    error?: string;
+}
+
 // Force use of local Deno proxy port for now (bypassing potentially stale .env)
 const SUPABASE_URL = 'http://127.0.0.1:8000';
 // const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'http://127.0.0.1:8000';
@@ -28,7 +42,7 @@ export async function POST(req: Request) {
 
         let dishName = "Detected Dish";
         let _isFood = true;
-        let analysisResult = null;
+        let analysisResult: AnalysisResult | null = null;
 
         // 1. GEMINI ANALYSIS (The "Brain")
         if (photoUrls && photoUrls[0]) {
@@ -163,88 +177,171 @@ export async function POST(req: Request) {
     }
 }
 
+// --- AI INTEGRATION (Multi-provider with automatic fallback) ---
+import Groq from "groq-sdk";
 
-// --- GEMINI INTEGRATION ---
-async function analyzeImageWithGemini(base64Data: string) {
+// Gemini models to try in order (each has separate quota)
+const GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-001",
+];
+
+// Groq vision models (Llama-4 supports image input)
+const GROQ_VISION_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+];
+
+const ANALYSIS_PROMPT = `You are an expert food critic specializing in INDIAN CUISINE and PACKAGED SNACKS.
+Analyze this food image.
+
+1. Identify the dish name. 
+   - If it is a packaged snack (like Kurkure, Lays, Haldiram's), identify the BRAND and FLAVOR (e.g., "Kurkure Masala Munch", "Lays India's Magic Masala").
+   - If it is a prepared Indian dish, use the authentic name (e.g., "Pav Bhaji", "Masala Dosa", "Paneer Butter Masala").
+
+2. Determine the TYPE: "packaged" (chips, biscuits, chocolate, canned) OR "prepared" (cooked meals, salads, fruits).
+
+3. Estimate ingredients:
+   - For packaged items: List the likely ingredients based on the brand/flavor (e.g. "Rice Meal, Corn Meal, Spices").
+   - For prepared items: List standard ingredients.
+
+4. Assess freshness: "fresh", "caution" (looks stale/old), or "spoiled" (mold/rot visible).
+
+5. Estimate calories per serving.
+
+6. Estimate protein (grams) and fat (grams) per serving.
+
+Return ONLY valid JSON (no markdown, no code fences):
+{
+    "isFood": boolean,
+    "dishName": "string",
+    "type": "packaged" | "prepared",
+    "ingredients": ["string", "string"],
+    "freshness": "fresh" | "caution" | "spoiled",
+    "calories": number,
+    "protein": number,
+    "fat": number,
+    "reason": "string (if not food)"
+}`;
+
+// --- PRIMARY: Gemini (tries all models) ---
+async function tryGemini(base64Content: string): Promise<{ result: AnalysisResult | null; success: boolean }> {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey || apiKey.startsWith("TODO")) {
-        console.warn("GEMINI_API_KEY is missing or not set. Initializing dummy response for development.");
-        // Fallback for when user hasn't set the key yet
-        return {
-            isFood: true,
-            dishName: "Test Food (Key Missing)",
-            ingredients: ["Sample Ingredient 1", "Sample Ingredient 2"],
-            freshness: "fresh",
-            calories: 250,
-            protein: 12,
-            fat: 8,
-            type: "prepared"
-        };
+        console.warn("GEMINI_API_KEY not set, skipping Gemini.");
+        return { result: null, success: false };
     }
 
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-        model: "gemini-2.0-flash",
-        generationConfig: { responseMimeType: "application/json" } // Force JSON mode
-    });
 
-    // Clean base64 for Gemini (remove data:image/...;base64, prefix if present)
+    for (const modelName of GEMINI_MODELS) {
+        try {
+            console.log(`[Gemini] Trying model: ${modelName}`);
+            const model = genAI.getGenerativeModel({
+                model: modelName,
+                generationConfig: { responseMimeType: "application/json" }
+            });
+
+            const result = await model.generateContent([
+                ANALYSIS_PROMPT,
+                { inlineData: { data: base64Content, mimeType: "image/jpeg" } },
+            ]);
+
+            const text = (await result.response).text();
+            console.log(`[Gemini:${modelName}] ✓ Response received`);
+            return { result: JSON.parse(text) as AnalysisResult, success: true };
+
+        } catch (e: unknown) {
+            const errStr = String(e);
+            if (errStr.includes("429") || errStr.includes("quota") || errStr.includes("Too Many Requests") || errStr.includes("RESOURCE_EXHAUSTED")) {
+                console.warn(`[Gemini:${modelName}] Quota exceeded, trying next...`);
+                continue;
+            }
+            console.error(`[Gemini:${modelName}] Error:`, errStr);
+            continue; // Try next model even for other errors
+        }
+    }
+
+    console.warn("[Gemini] All models exhausted.");
+    return { result: null, success: false };
+}
+
+// --- FALLBACK: Groq Vision (Llama-4) ---
+async function tryGroq(base64Content: string): Promise<{ result: AnalysisResult | null; success: boolean }> {
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) {
+        console.warn("GROQ_API_KEY not set, skipping Groq.");
+        return { result: null, success: false };
+    }
+
+    const groq = new Groq({ apiKey });
+
+    for (const modelName of GROQ_VISION_MODELS) {
+        try {
+            console.log(`[Groq] Trying model: ${modelName}`);
+
+            const completion = await groq.chat.completions.create({
+                model: modelName,
+                messages: [
+                    {
+                        role: "user",
+                        content: [
+                            { type: "text", text: ANALYSIS_PROMPT },
+                            {
+                                type: "image_url",
+                                image_url: {
+                                    url: `data:image/jpeg;base64,${base64Content}`,
+                                },
+                            },
+                        ],
+                    },
+                ],
+                temperature: 0.3,
+                max_completion_tokens: 1024,
+                response_format: { type: "json_object" },
+            });
+
+            const text = completion.choices[0]?.message?.content || "";
+            console.log(`[Groq:${modelName}] ✓ Response received`);
+            return { result: JSON.parse(text) as AnalysisResult, success: true };
+
+        } catch (e: unknown) {
+            const errStr = String(e);
+            if (errStr.includes("429") || errStr.includes("rate_limit")) {
+                console.warn(`[Groq:${modelName}] Rate limited, trying next...`);
+                continue;
+            }
+            console.error(`[Groq:${modelName}] Error:`, errStr);
+            continue;
+        }
+    }
+
+    console.warn("[Groq] All models exhausted.");
+    return { result: null, success: false };
+}
+
+// --- MAIN ANALYSIS FUNCTION (cascading fallback) ---
+async function analyzeImageWithGemini(base64Data: string): Promise<AnalysisResult> {
     const base64Content = base64Data.replace(/^data:image\/\w+;base64,/, "");
 
-    const prompt = `You are an expert food critic specializing in INDIAN CUISINE and PACKAGED SNACKS.
-    Analyze this food image.
-    
-    1. Identify the dish name. 
-       - If it is a packaged snack (like Kurkure, Lays, Haldiram's), identify the BRAND and FLAVOR (e.g., "Kurkure Masala Munch", "Lays India's Magic Masala").
-       - If it is a prepared Indian dish, use the authentic name (e.g., "Pav Bhaji", "Masala Dosa", "Paneer Butter Masala").
-    
-    2. Determine the TYPE: "packaged" (chips, biscuits, chocolate, canned) OR "prepared" (cooked meals, salads, fruits).
+    // 1. Try all Gemini models first
+    const geminiResult = await tryGemini(base64Content);
+    if (geminiResult.success) return geminiResult.result!;
 
-    3. Estimate ingredients:
-       - For packaged items: List the likely ingredients based on the brand/flavor (e.g. "Rice Meal, Corn Meal, Spices").
-       - For prepared items: List standard ingredients.
+    // 2. Fallback to Groq vision models
+    console.log("[Fallback] Gemini failed, trying Groq...");
+    const groqResult = await tryGroq(base64Content);
+    if (groqResult.success) return groqResult.result!;
 
-    4. Assess freshness: "fresh", "caution" (looks stale/old), or "spoiled" (mold/rot visible).
-
-    5. Estimate calories per serving.
-
-    6. Estimate protein (grams) and fat (grams) per serving.
-
-    Return JSON:
-    {
-        "isFood": boolean,
-        "dishName": "string",
-        "type": "packaged" | "prepared",
-        "ingredients": ["string", "string"],
-        "freshness": "fresh" | "caution" | "spoiled",
-        "calories": number,
-        "protein": number,
-        "fat": number,
-        "reason": "string (if not food)"
-    }`;
-
-    try {
-        const result = await model.generateContent([
-            prompt,
-            {
-                inlineData: {
-                    data: base64Content,
-                    mimeType: "image/jpeg",
-                },
-            },
-        ]);
-
-        const response = await result.response;
-        const text = response.text();
-
-        console.log("Raw Gemini Response:", text);
-
-        return JSON.parse(text);
-
-    } catch (e) {
-        console.error("Gemini API Failed:", e);
-        return { isFood: false, error: String(e) };
-    }
+    // 3. All providers failed
+    console.error("[FATAL] All AI providers failed.");
+    return {
+        isFood: false,
+        error: "All AI providers are currently unavailable. Gemini quota exceeded and Groq failed. Please wait a few minutes and try again."
+    };
 }
 
 function parseIngredients(ingString: string | unknown[]): string[] {
